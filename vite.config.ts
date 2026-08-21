@@ -4,9 +4,7 @@ import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 
 export default defineConfig({
-  // GitHub Pages uses /SmartCare/
-  // Netlify uses /
-  base: process.env.NETLIFY ? '/' : '/SmartCare/',
+  base: '/',
 
   plugins: [
     react(),
