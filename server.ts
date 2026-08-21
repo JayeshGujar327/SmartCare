@@ -1,0 +1,936 @@
+import express, { Request, Response } from 'express';
+import path from 'path';
+import dotenv from 'dotenv';
+import QRCode from 'qrcode';
+import { createServer as createViteServer } from 'vite';
+
+import { db } from './server/db';
+import { VaccinationScheduleService } from './server/scheduleEngine';
+import { SmartCareAIEngine } from './server/ragEngine';
+import { NotificationService } from './server/notificationService';
+import {
+  PatientProfile,
+  User,
+  VaccinationScheduleItem,
+  MedicineItem,
+  MedicineLog,
+  VaccinationCenter,
+  DigitalVaccinationCard,
+  AreaRequirement
+} from './src/types';
+
+dotenv.config();
+
+const app = express();
+const PORT = 3000;
+
+app.use(express.json());
+
+// In-memory OTP storage for mock/demo testing
+const activeOtps: Record<string, { otp: string; expiresAt: number }> = {};
+
+// ==========================================
+// 1. AUTHENTICATION & SESSION APIs
+// ==========================================
+
+app.post('/api/auth/send-otp', (req: Request, res: Response) => {
+  const { mobile } = req.body;
+  if (!mobile || mobile.length < 10) {
+    return res.status(400).json({ error: 'Valid 10-digit mobile number required' });
+  }
+
+  // Generate 6-digit OTP (for demo default is '123456' or dynamic)
+  const otp = mobile === '9876543210' ? '123456' : Math.floor(100000 + Math.random() * 900000).toString();
+  activeOtps[mobile] = {
+    otp,
+    expiresAt: Date.now() + 5 * 60 * 1000 // 5 minutes
+  };
+
+  // Dispatch mock SMS notification log
+  db.notificationLogs.unshift({
+    id: `otp-${Date.now()}`,
+    userId: 'user-demo-1',
+    type: 'SPECIAL_CAMPAIGN',
+    channel: 'SMS',
+    title: 'SmartCare Login OTP',
+    message: `Your SmartCare verification OTP code is ${otp}. Valid for 5 minutes. Do not share with anyone.`,
+    scheduledFor: new Date().toISOString(),
+    sentAt: new Date().toISOString(),
+    status: 'DELIVERED',
+    recipient: `${mobile} (SMS)`
+  });
+
+  return res.json({
+    success: true,
+    message: `OTP sent successfully to ${mobile}`,
+    // Development convenience hint
+    devHint: `OTP: ${otp}`
+  });
+});
+
+app.post('/api/auth/verify-otp', (req: Request, res: Response) => {
+  const { mobile, otp, name, preferredLanguage } = req.body;
+
+  if (!mobile || !otp) {
+    return res.status(400).json({ error: 'Mobile and OTP are required' });
+  }
+
+  const record = activeOtps[mobile];
+  // Allow demo OTP 123456 or stored OTP
+  const isValid = otp === '123456' || (record && record.otp === otp && record.expiresAt > Date.now());
+
+  if (!isValid) {
+    return res.status(400).json({ error: 'Invalid or expired OTP. Use 123456 for demo mode.' });
+  }
+
+  delete activeOtps[mobile];
+
+  let user = db.users.find(u => u.mobile === mobile);
+  if (!user) {
+    user = {
+      id: `user-${Date.now()}`,
+      name: name || 'SmartCare Parent',
+      mobile,
+      role: 'USER',
+      preferredLanguage: preferredLanguage || 'en',
+      state: 'Maharashtra',
+      district: 'Pune',
+      city: 'Pune',
+      createdAt: new Date().toISOString()
+    };
+    db.users.push(user);
+    db.preferences[user.id] = {
+      userId: user.id,
+      smsEnabled: true,
+      whatsappEnabled: true,
+      emailEnabled: true,
+      voiceEnabled: false,
+      inAppEnabled: true,
+      reminderIntervalsDays: [10, 7, 5, 1],
+      preferredLanguage: user.preferredLanguage
+    };
+  }
+
+  return res.json({
+    success: true,
+    token: `jwt-mock-${user.id}-${Date.now()}`,
+    user
+  });
+});
+
+app.post('/api/auth/demo-login', (req: Request, res: Response) => {
+  const { role } = req.body; // 'USER' | 'ADMIN'
+  const user = role === 'ADMIN'
+    ? db.users.find(u => u.role === 'ADMIN') || db.users[1]
+    : db.users.find(u => u.role === 'USER') || db.users[0];
+
+  return res.json({
+    success: true,
+    token: `jwt-mock-${user.id}-${Date.now()}`,
+    user
+  });
+});
+
+app.get('/api/auth/me', (req: Request, res: Response) => {
+  const userId = req.headers['x-user-id'] as string || 'user-demo-1';
+  const user = db.users.find(u => u.id === userId) || db.users[0];
+  return res.json({ user });
+});
+
+// ==========================================
+// 2. PATIENT PROFILES & SCHEDULE ENGINE
+// ==========================================
+
+app.get('/api/patients', (req: Request, res: Response) => {
+  const userId = req.headers['x-user-id'] as string || 'user-demo-1';
+  const patients = db.patients.filter(p => p.userId === userId);
+  return res.json({ patients });
+});
+
+app.post('/api/patients', (req: Request, res: Response) => {
+  const userId = req.headers['x-user-id'] as string || 'user-demo-1';
+  const { name, dob, gender, relation, parentGuardianName, mobile, bloodGroup, state, district, city, emergencyContact, notes } = req.body;
+
+  if (!name || !dob) {
+    return res.status(400).json({ error: 'Patient name and date of birth are required.' });
+  }
+
+  const newPatient: PatientProfile = {
+    id: `patient-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    userId,
+    name,
+    dob,
+    gender: gender || 'MALE',
+    relation: relation || 'CHILD',
+    parentGuardianName,
+    mobile,
+    bloodGroup,
+    state: state || 'Maharashtra',
+    district: district || 'Pune',
+    city,
+    emergencyContact,
+    notes,
+    createdAt: new Date().toISOString()
+  };
+
+  db.patients.push(newPatient);
+
+  // Automatically generate complete DOB-based schedule
+  const generatedSchedule = db.generateSchedulesForPatient(newPatient);
+
+  // Run missed vaccine detection on new schedule
+  VaccinationScheduleService.runMissedVaccineDetector(newPatient.id);
+
+  return res.status(201).json({
+    patient: newPatient,
+    scheduleCount: generatedSchedule.length
+  });
+});
+
+app.put('/api/patients/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const index = db.patients.findIndex(p => p.id === id);
+  if (index === -1) return res.status(404).json({ error: 'Patient not found' });
+
+  const oldDob = db.patients[index].dob;
+  db.patients[index] = { ...db.patients[index], ...req.body };
+
+  // If DOB changed, recalculate schedule
+  if (req.body.dob && req.body.dob !== oldDob) {
+    db.generateSchedulesForPatient(db.patients[index]);
+    VaccinationScheduleService.runMissedVaccineDetector(id);
+  }
+
+  return res.json({ patient: db.patients[index] });
+});
+
+app.delete('/api/patients/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  db.patients = db.patients.filter(p => p.id !== id);
+  db.scheduleItems = db.scheduleItems.filter(s => s.patientId !== id);
+  db.medicines = db.medicines.filter(m => m.patientId !== id);
+  db.medicineLogs = db.medicineLogs.filter(l => l.patientId !== id);
+  return res.json({ success: true, message: 'Patient profile deleted' });
+});
+
+// ==========================================
+// 3. VACCINATION SCHEDULE & TRACKER APIs
+// ==========================================
+
+app.get('/api/vaccines', (req: Request, res: Response) => {
+  return res.json({ rules: db.vaccineRules });
+});
+
+app.get('/api/schedules/:patientId', (req: Request, res: Response) => {
+  const { patientId } = req.params;
+  const patient = db.patients.find(p => p.id === patientId);
+  if (!patient) return res.status(404).json({ error: 'Patient profile not found' });
+
+  // Update real-time status of missed/due doses
+  VaccinationScheduleService.runMissedVaccineDetector(patientId);
+
+  const age = VaccinationScheduleService.calculateAge(patient.dob);
+  const metrics = VaccinationScheduleService.getPatientVaccinationMetrics(patientId);
+  const items = db.scheduleItems.filter(s => s.patientId === patientId);
+
+  // Sort chronologically
+  items.sort((a, b) => new Date(a.expectedDate).getTime() - new Date(b.expectedDate).getTime());
+
+  return res.json({
+    patient,
+    age,
+    metrics,
+    items
+  });
+});
+
+app.post('/api/schedules/:patientId/record-completion', (req: Request, res: Response) => {
+  const { patientId } = req.params;
+  const { itemId, completedDate, administeredCenter, administeredDoctor, batchNumber, remarks } = req.body;
+
+  const item = db.scheduleItems.find(s => s.id === itemId && s.patientId === patientId);
+  if (!item) return res.status(404).json({ error: 'Schedule record not found' });
+
+  item.status = 'COMPLETED';
+  item.completedDate = completedDate || new Date().toISOString().split('T')[0];
+  item.administeredCenter = administeredCenter || 'Local Health Facility';
+  item.administeredDoctor = administeredDoctor;
+  item.batchNumber = batchNumber || `BATCH-${Math.floor(1000 + Math.random() * 9000)}`;
+  item.remarks = remarks;
+
+  const metrics = VaccinationScheduleService.getPatientVaccinationMetrics(patientId);
+
+  return res.json({
+    success: true,
+    item,
+    metrics
+  });
+});
+
+app.put('/api/schedules/item/:itemId', (req: Request, res: Response) => {
+  const { itemId } = req.params;
+  const item = db.scheduleItems.find(s => s.id === itemId);
+  if (!item) return res.status(404).json({ error: 'Schedule item not found' });
+
+  Object.assign(item, req.body);
+  return res.json({ item });
+});
+
+// ==========================================
+// 4. MEDICINE REMINDER & DAILY LOGS
+// ==========================================
+
+app.get('/api/medicines/:patientId', (req: Request, res: Response) => {
+  const { patientId } = req.params;
+  const medicines = db.medicines.filter(m => m.patientId === patientId);
+  return res.json({ medicines });
+});
+
+app.post('/api/medicines', (req: Request, res: Response) => {
+  const userId = req.headers['x-user-id'] as string || 'user-demo-1';
+  const { patientId, name, dosage, frequency, reminderTimes, startDate, endDate, foodTiming, instructions, purpose } = req.body;
+
+  if (!patientId || !name || !dosage) {
+    return res.status(400).json({ error: 'Patient, medicine name, and dosage are required' });
+  }
+
+  const newMed: MedicineItem = {
+    id: `med-${Date.now()}`,
+    patientId,
+    userId,
+    name,
+    dosage,
+    frequency: frequency || 'ONCE_DAILY',
+    reminderTimes: reminderTimes && reminderTimes.length > 0 ? reminderTimes : ['09:00'],
+    startDate: startDate || new Date().toISOString().split('T')[0],
+    endDate,
+    foodTiming: foodTiming || 'AFTER_FOOD',
+    instructions,
+    purpose,
+    isActive: true,
+    createdAt: new Date().toISOString()
+  };
+
+  db.medicines.push(newMed);
+
+  // Generate today log entry
+  const todayStr = new Date().toISOString().split('T')[0];
+  for (const time of newMed.reminderTimes) {
+    db.medicineLogs.push({
+      id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      medicineId: newMed.id,
+      patientId,
+      date: todayStr,
+      scheduledTime: time,
+      status: 'UPCOMING'
+    });
+  }
+
+  return res.status(201).json({ medicine: newMed });
+});
+
+app.put('/api/medicines/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const index = db.medicines.findIndex(m => m.id === id);
+  if (index === -1) return res.status(404).json({ error: 'Medicine not found' });
+
+  db.medicines[index] = { ...db.medicines[index], ...req.body };
+  return res.json({ medicine: db.medicines[index] });
+});
+
+app.delete('/api/medicines/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  db.medicines = db.medicines.filter(m => m.id !== id);
+  db.medicineLogs = db.medicineLogs.filter(l => l.medicineId !== id);
+  return res.json({ success: true, message: 'Medicine removed' });
+});
+
+app.get('/api/medicines/:patientId/today', (req: Request, res: Response) => {
+  const { patientId } = req.params;
+  const todayStr = new Date().toISOString().split('T')[0];
+
+  const patientMeds = db.medicines.filter(m => m.patientId === patientId && m.isActive);
+  let todayLogs = db.medicineLogs.filter(l => l.patientId === patientId && l.date === todayStr);
+
+  // If logs not generated yet for today, generate them
+  if (todayLogs.length === 0 && patientMeds.length > 0) {
+    for (const med of patientMeds) {
+      for (const time of med.reminderTimes) {
+        const log: MedicineLog = {
+          id: `log-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          medicineId: med.id,
+          patientId,
+          date: todayStr,
+          scheduledTime: time,
+          status: 'UPCOMING'
+        };
+        db.medicineLogs.push(log);
+        todayLogs.push(log);
+      }
+    }
+  }
+
+  // Combine log with medicine metadata
+  const enriched = todayLogs.map(log => {
+    const med = patientMeds.find(m => m.id === log.medicineId);
+    return {
+      ...log,
+      medicineName: med ? med.name : 'Prescription Medicine',
+      dosage: med ? med.dosage : '',
+      foodTiming: med ? med.foodTiming : 'AFTER_FOOD',
+      instructions: med ? med.instructions : ''
+    };
+  });
+
+  enriched.sort((a, b) => a.scheduledTime.localeCompare(b.scheduledTime));
+
+  return res.json({
+    date: todayStr,
+    slots: enriched,
+    activeMedicinesCount: patientMeds.length
+  });
+});
+
+app.post('/api/medicines/log/:id/status', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { status } = req.body; // 'TAKEN' | 'MISSED' | 'SKIPPED' | 'UPCOMING'
+
+  const log = db.medicineLogs.find(l => l.id === id);
+  if (!log) return res.status(404).json({ error: 'Medicine log slot not found' });
+
+  log.status = status;
+  if (status === 'TAKEN') {
+    log.takenAt = new Date().toISOString();
+  } else {
+    log.takenAt = undefined;
+  }
+
+  return res.json({ success: true, log });
+});
+
+// ==========================================
+// 5. DIGITAL VACCINATION CARD & QR CODE
+// ==========================================
+
+app.get('/api/qr/card/:patientId', async (req: Request, res: Response) => {
+  try {
+    const { patientId } = req.params;
+    const patient = db.patients.find(p => p.id === patientId);
+    if (!patient) return res.status(404).json({ error: 'Patient not found' });
+
+    const items = db.scheduleItems.filter(s => s.patientId === patientId);
+    const completed = items.filter(s => s.status === 'COMPLETED');
+    const pending = items.filter(s => s.status !== 'COMPLETED');
+
+    const metrics = VaccinationScheduleService.getPatientVaccinationMetrics(patientId);
+    const verificationId = `SC-IND-${patient.id.replace('patient-', '').toUpperCase()}-2026`;
+
+    // Public QR verification payload URL
+    const appUrl = process.env.APP_URL || `http://localhost:${PORT}`;
+    const verificationUrl = `${appUrl}/#verify/${verificationId}`;
+
+    const qrCodeDataUrl = await QRCode.toDataURL(verificationUrl, {
+      width: 256,
+      margin: 2,
+      color: {
+        dark: '#0f172a',
+        light: '#ffffff'
+      }
+    });
+
+    const card: DigitalVaccinationCard = {
+      verificationId,
+      patient,
+      completedVaccinations: completed,
+      pendingVaccinations: pending,
+      vaccinationScore: metrics.scorePercentage,
+      totalRequired: metrics.total,
+      totalCompleted: metrics.completed,
+      nextDueDate: metrics.nextUpcoming ? metrics.nextUpcoming.expectedDate : undefined,
+      nextVaccineName: metrics.nextUpcoming ? metrics.nextUpcoming.vaccineName : undefined,
+      qrCodeDataUrl,
+      issuedDate: new Date().toISOString().split('T')[0]
+    };
+
+    return res.json({ card });
+  } catch (err) {
+    console.error('QR generation error:', err);
+    return res.status(500).json({ error: 'Failed to generate digital vaccination card' });
+  }
+});
+
+app.get('/api/qr/verify/:verificationId', (req: Request, res: Response) => {
+  const { verificationId } = req.params;
+  // Extract patient id from verification ID format
+  const patient = db.patients[0]; // demo resolve
+  if (!patient) return res.status(404).json({ error: 'Invalid verification record ID' });
+
+  const metrics = VaccinationScheduleService.getPatientVaccinationMetrics(patient.id);
+  const completed = db.scheduleItems.filter(s => s.patientId === patient.id && s.status === 'COMPLETED');
+
+  return res.json({
+    verified: true,
+    verificationId,
+    patientName: patient.name,
+    dob: patient.dob,
+    state: patient.state,
+    completedDosesCount: completed.length,
+    scorePercentage: metrics.scorePercentage,
+    completedVaccines: completed.map(c => ({
+      name: c.vaccineName,
+      dose: c.doseNumber,
+      date: c.completedDate,
+      center: c.administeredCenter,
+      batch: c.batchNumber
+    })),
+    issuer: 'SmartCare Universal Immunization Verification Protocol'
+  });
+});
+
+// ==========================================
+// 6. NEARBY VACCINATION CENTERS & CAMPS
+// ==========================================
+
+app.get('/api/centers', (req: Request, res: Response) => {
+  const { type, search, lat, lng } = req.query;
+
+  let results = [...db.centers];
+
+  if (type && type !== 'ALL') {
+    results = results.filter(c => c.type === type);
+  }
+
+  if (search && typeof search === 'string') {
+    const q = search.toLowerCase();
+    results = results.filter(
+      c =>
+        c.name.toLowerCase().includes(q) ||
+        c.city.toLowerCase().includes(q) ||
+        c.district.toLowerCase().includes(q) ||
+        c.availableVaccines.some(v => v.toLowerCase().includes(q))
+    );
+  }
+
+  // Calculate approximate distance if user lat/lng provided
+  if (lat && lng) {
+    const uLat = parseFloat(lat as string);
+    const uLng = parseFloat(lng as string);
+
+    results = results.map(c => {
+      // Haversine formula
+      const R = 6371; // km
+      const dLat = ((c.lat - uLat) * Math.PI) / 180;
+      const dLon = ((c.lng - uLng) * Math.PI) / 180;
+      const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos((uLat * Math.PI) / 180) * Math.cos((c.lat * Math.PI) / 180) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+      const dist = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return {
+        ...c,
+        distanceKm: Math.round(dist * 10) / 10
+      };
+    });
+
+    results.sort((a, b) => (a.distanceKm || 0) - (b.distanceKm || 0));
+  }
+
+  return res.json({ centers: results });
+});
+
+app.post('/api/centers', (req: Request, res: Response) => {
+  const { name, type, address, city, district, state, pinCode, lat, lng, phone, timings, availableVaccines, isFree, facilities } = req.body;
+  const newCenter: VaccinationCenter = {
+    id: `center-${Date.now()}`,
+    name,
+    type: type || 'GOVT_PHC',
+    address,
+    city: city || 'Pune',
+    district: district || 'Pune',
+    state: state || 'Maharashtra',
+    pinCode: pinCode || '411001',
+    lat: lat || 18.5204,
+    lng: lng || 73.8567,
+    phone: phone || '+91 20 2000 0000',
+    timings: timings || 'Mon-Sat: 09:00 AM - 04:00 PM',
+    availableVaccines: availableVaccines || ['BCG', 'OPV', 'Pentavalent', 'MR', 'DPT'],
+    isFree: isFree !== undefined ? isFree : true,
+    facilities: facilities || ['Cold Chain', 'Govt Supply'],
+    rating: 4.5
+  };
+
+  db.centers.push(newCenter);
+  return res.status(201).json({ center: newCenter });
+});
+
+// ==========================================
+// 7. AREA REQUIREMENTS & CAMPAIGNS
+// ==========================================
+
+app.get('/api/area-requirements', (req: Request, res: Response) => {
+  const { state, district, priority, search } = req.query;
+  let results = [...db.areaRequirements];
+
+  if (state && typeof state === 'string' && state !== 'ALL') {
+    results = results.filter(c => c.state.toLowerCase() === state.toLowerCase() || c.state === 'All India');
+  }
+
+  if (district && typeof district === 'string' && district !== 'ALL') {
+    results = results.filter(c => c.district.toLowerCase() === district.toLowerCase() || c.district === 'National');
+  }
+
+  if (priority && typeof priority === 'string' && priority !== 'ALL') {
+    results = results.filter(c => c.priority === priority);
+  }
+
+  if (search && typeof search === 'string') {
+    const q = search.toLowerCase();
+    results = results.filter(
+      c =>
+        c.title.toLowerCase().includes(q) ||
+        c.description.toLowerCase().includes(q) ||
+        (c.city && c.city.toLowerCase().includes(q)) ||
+        c.district.toLowerCase().includes(q) ||
+        c.state.toLowerCase().includes(q) ||
+        c.vaccines.some(v => v.toLowerCase().includes(q))
+    );
+  }
+
+  return res.json({ campaigns: results });
+});
+
+app.post('/api/area-requirements', (req: Request, res: Response) => {
+  const { title, description, state, district, city, campaignName, targetAgeGroup, startDate, endDate, vaccines, instructions, priority, isFree, source } = req.body;
+
+  if (!title || !startDate || !endDate) {
+    return res.status(400).json({ error: 'Title, start date and end date are required for a campaign drive.' });
+  }
+
+  const newCampaign: AreaRequirement = {
+    id: `area-${Date.now()}`,
+    title,
+    description: description || 'Universal Immunization Programme Special Community Drive',
+    state: state || 'All India',
+    district: district || 'National',
+    city: city || '',
+    campaignName: campaignName || title,
+    targetAgeGroup: targetAgeGroup || 'Children 0-5 Years',
+    startDate,
+    endDate,
+    vaccines: Array.isArray(vaccines) ? vaccines : ['Routine UIP Vaccines'],
+    vaccinesOffered: Array.isArray(vaccines) ? vaccines : ['Routine UIP Vaccines'],
+    instructions: instructions || 'Available at all Government PHCs, Sub-Centers, and Anganwadi booths.',
+    priority: priority || 'HIGH',
+    isUrgent: priority === 'HIGH',
+    isFree: isFree !== undefined ? isFree : true,
+    source: source || 'Public Health Department / MoHFW',
+    lastUpdated: new Date().toISOString().split('T')[0]
+  };
+
+  db.areaRequirements.unshift(newCampaign);
+  return res.status(201).json({ campaign: newCampaign });
+});
+
+app.delete('/api/area-requirements/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  db.areaRequirements = db.areaRequirements.filter(c => c.id !== id);
+  return res.json({ success: true, message: 'Campaign removed' });
+});
+
+// ==========================================
+// 8. NOTIFICATION PREFERENCES & LOGS
+// ==========================================
+
+app.get('/api/notifications/preferences/:userId', (req: Request, res: Response) => {
+  const { userId } = req.params;
+  const prefs = db.preferences[userId] || {
+    userId,
+    smsEnabled: true,
+    whatsappEnabled: true,
+    emailEnabled: true,
+    voiceEnabled: false,
+    inAppEnabled: true,
+    reminderIntervalsDays: [10, 7, 5, 1],
+    preferredLanguage: 'en'
+  };
+  return res.json({ preferences: prefs });
+});
+
+app.put('/api/notifications/preferences/:userId', (req: Request, res: Response) => {
+  const { userId } = req.params;
+  db.preferences[userId] = { ...db.preferences[userId], ...req.body, userId };
+  return res.json({ preferences: db.preferences[userId] });
+});
+
+app.get('/api/notifications/logs/:userId', (req: Request, res: Response) => {
+  const { userId } = req.params;
+  const logs = db.notificationLogs.filter(l => l.userId === userId || l.userId === 'user-demo-1');
+  return res.json({ logs });
+});
+
+app.post('/api/notifications/trigger-reminders', async (req: Request, res: Response) => {
+  const userId = req.headers['x-user-id'] as string || 'user-demo-1';
+  const result = await NotificationService.generateDailyReminders(userId);
+  return res.json({
+    success: true,
+    message: `Generated ${result.createdCount} notification reminders`,
+    logs: db.notificationLogs.slice(0, 10)
+  });
+});
+
+app.post('/api/notifications/test-send', async (req: Request, res: Response) => {
+  const userId = req.headers['x-user-id'] as string || 'user-demo-1';
+  const { channel, message, title, patientId, patientName } = req.body;
+
+  const log = await NotificationService.dispatchNotification(
+    userId,
+    'VACCINATION_REMINDER',
+    channel || 'WHATSAPP',
+    title || 'SmartCare Alert Test',
+    message || 'Test reminder notification from SmartCare Healthcare System.',
+    `+91 9876543210 (${channel || 'WHATSAPP'})`,
+    patientId,
+    patientName
+  );
+
+  return res.json({ success: true, log });
+});
+
+// ==========================================
+// 9. SMARTCARE AI & RAG HEALTH ASSISTANT
+// ==========================================
+
+app.post('/api/ai/chat', async (req: Request, res: Response) => {
+  try {
+    const { prompt, language, patientId } = req.body;
+
+    if (!prompt) {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    let patientContextSummary = '';
+    if (patientId) {
+      const patient = db.patients.find(p => p.id === patientId);
+      if (patient) {
+        const age = VaccinationScheduleService.calculateAge(patient.dob);
+        const metrics = VaccinationScheduleService.getPatientVaccinationMetrics(patientId);
+        patientContextSummary = `Patient Name: ${patient.name}, DOB: ${patient.dob}, Age: ${age.formattedText}, Vaccination Score: ${metrics.scorePercentage}%, Next Upcoming Vaccine: ${metrics.nextUpcoming ? metrics.nextUpcoming.vaccineName : 'None'}, Missed Vaccines: ${metrics.missedItems.map(m => m.vaccineName).join(', ') || 'None'}`;
+      }
+    }
+
+    const result = await SmartCareAIEngine.answerQuestion(
+      prompt,
+      language || 'en',
+      patientContextSummary
+    );
+
+    return res.json({
+      text: result.text,
+      references: result.references
+    });
+  } catch (err) {
+    console.error('AI chat endpoint error:', err);
+    return res.status(500).json({
+      error: 'SmartCare AI is temporarily busy. Please retry in a moment.'
+    });
+  }
+});
+
+// ==========================================
+// 10. GROWTH TRACKING & MILESTONES APIS
+// ==========================================
+
+app.get('/api/growth/:patientId', (req: Request, res: Response) => {
+  const { patientId } = req.params;
+  const logs = db.growthLogs.filter(g => g.patientId === patientId);
+  // Sort chronologically by date
+  logs.sort((a, b) => new Date(a.recordedDate).getTime() - new Date(b.recordedDate).getTime());
+  return res.json({ logs });
+});
+
+app.post('/api/growth/:patientId', (req: Request, res: Response) => {
+  const { patientId } = req.params;
+  const { recordedDate, ageMonths, weightKg, heightCm, headCircumferenceCm, notes, recordedBy } = req.body;
+
+  if (!recordedDate || !weightKg || !heightCm) {
+    return res.status(400).json({ error: 'Recorded date, weight (kg), and height (cm) are required.' });
+  }
+
+  const patient = db.patients.find(p => p.id === patientId);
+  let calculatedAge = ageMonths;
+  if (calculatedAge === undefined && patient) {
+    const dob = new Date(patient.dob);
+    const rec = new Date(recordedDate);
+    calculatedAge = Math.max(0, (rec.getFullYear() - dob.getFullYear()) * 12 + (rec.getMonth() - dob.getMonth()));
+  }
+
+  const w = parseFloat(weightKg);
+  const h = parseFloat(heightCm);
+  const hMeters = h / 100;
+  const bmi = Math.round((w / (hMeters * hMeters)) * 10) / 10;
+
+  const newLog = {
+    id: `growth-${Date.now()}`,
+    patientId,
+    recordedDate,
+    ageMonths: calculatedAge || 0,
+    weightKg: w,
+    heightCm: h,
+    headCircumferenceCm: headCircumferenceCm ? parseFloat(headCircumferenceCm) : undefined,
+    bmi,
+    weightPercentile: 50,
+    heightPercentile: 50,
+    growthStatus: 'HEALTHY' as const,
+    notes: notes || '',
+    recordedBy: recordedBy || 'Parent / Caregiver'
+  };
+
+  db.growthLogs.push(newLog);
+  return res.status(201).json({ success: true, log: newLog });
+});
+
+app.put('/api/growth/:patientId/:id', (req: Request, res: Response) => {
+  const { patientId, id } = req.params;
+  const log = db.growthLogs.find(g => g.id === id && g.patientId === patientId);
+  if (!log) return res.status(404).json({ error: 'Growth record not found' });
+
+  const { recordedDate, ageMonths, weightKg, heightCm, headCircumferenceCm, notes, recordedBy } = req.body;
+  if (recordedDate) log.recordedDate = recordedDate;
+  if (ageMonths !== undefined) log.ageMonths = ageMonths;
+  if (weightKg !== undefined) log.weightKg = parseFloat(weightKg);
+  if (heightCm !== undefined) log.heightCm = parseFloat(heightCm);
+  if (headCircumferenceCm !== undefined) log.headCircumferenceCm = parseFloat(headCircumferenceCm);
+  if (notes !== undefined) log.notes = notes;
+  if (recordedBy !== undefined) log.recordedBy = recordedBy;
+
+  if (log.heightCm > 0) {
+    const hM = log.heightCm / 100;
+    log.bmi = Math.round((log.weightKg / (hM * hM)) * 10) / 10;
+  }
+
+  return res.json({ success: true, log });
+});
+
+app.delete('/api/growth/:patientId/:id', (req: Request, res: Response) => {
+  const { patientId, id } = req.params;
+  db.growthLogs = db.growthLogs.filter(g => !(g.id === id && g.patientId === patientId));
+  return res.json({ success: true, message: 'Growth log deleted successfully' });
+});
+
+app.get('/api/milestones/:patientId', (req: Request, res: Response) => {
+  const { patientId } = req.params;
+  const progress = db.milestoneProgress.filter(m => m.patientId === patientId);
+  return res.json({ progress });
+});
+
+app.post('/api/milestones/:patientId', (req: Request, res: Response) => {
+  const { patientId } = req.params;
+  const { milestoneId, status, achievedDate, notes } = req.body;
+
+  if (!milestoneId || !status) {
+    return res.status(400).json({ error: 'Milestone ID and status are required' });
+  }
+
+  let item = db.milestoneProgress.find(m => m.patientId === patientId && m.milestoneId === milestoneId);
+  if (item) {
+    item.status = status;
+    item.achievedDate = status === 'ACHIEVED' ? (achievedDate || new Date().toISOString().split('T')[0]) : undefined;
+    if (notes !== undefined) item.notes = notes;
+  } else {
+    item = {
+      id: `mp-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      patientId,
+      milestoneId,
+      status,
+      achievedDate: status === 'ACHIEVED' ? (achievedDate || new Date().toISOString().split('T')[0]) : undefined,
+      notes
+    };
+    db.milestoneProgress.push(item);
+  }
+
+  return res.json({ success: true, item });
+});
+
+// ==========================================
+// 11. ADMIN DASHBOARD & KNOWLEDGE BASE APIs
+// ==========================================
+
+app.get('/api/admin/stats', (req: Request, res: Response) => {
+  const totalUsers = db.users.length;
+  const totalPatients = db.patients.length;
+  const totalVaccinesRecorded = db.scheduleItems.filter(s => s.status === 'COMPLETED').length;
+  const totalMissedDoses = db.scheduleItems.filter(s => s.status === 'MISSED').length;
+  const totalMedicines = db.medicines.length;
+  const totalNotificationsSent = db.notificationLogs.length;
+  const totalCenters = db.centers.length;
+
+  return res.json({
+    stats: {
+      totalUsers,
+      totalPatients,
+      totalVaccinesRecorded,
+      totalMissedDoses,
+      totalMedicines,
+      totalNotificationsSent,
+      totalCenters
+    },
+    recentLogs: db.notificationLogs.slice(0, 8),
+    recentPatients: db.patients.slice(0, 5)
+  });
+});
+
+app.post('/api/admin/vaccine-rules', (req: Request, res: Response) => {
+  const newRule = {
+    id: `vax-custom-${Date.now()}`,
+    ...req.body
+  };
+  db.vaccineRules.push(newRule);
+  return res.status(201).json({ rule: newRule });
+});
+
+app.get('/api/admin/knowledge', (req: Request, res: Response) => {
+  return res.json({ docs: db.knowledgeDocs });
+});
+
+app.post('/api/admin/knowledge', (req: Request, res: Response) => {
+  const { title, source, category, content, tags } = req.body;
+  const newDoc = {
+    id: `doc-${Date.now()}`,
+    title,
+    source,
+    category: category || 'GENERAL',
+    content,
+    version: '1.0',
+    status: 'ACTIVE' as const,
+    tags: tags || [],
+    updatedAt: new Date().toISOString().split('T')[0]
+  };
+  db.knowledgeDocs.push(newDoc);
+  return res.status(201).json({ doc: newDoc });
+});
+
+// ==========================================
+// VITE MIDDLEWARE & SERVER STARTUP
+// ==========================================
+
+async function startServer() {
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, 'localhost', () => {
+    console.log(`SmartCare Vaccination & Medicine Server listening on http://localhost:${PORT}`);
+  });
+}
+
+startServer();
+

@@ -1,0 +1,6 @@
+{
+  "name": "Smart Vaccination and Medicine Reminder System",
+  "description": "Intelligent healthcare assistance platform for child and family vaccination schedules, medicine reminders, WHO child growth and development milestone tracking, digital vaccination cards with QR verification, nearby center finder, and AI health assistant in English, Hindi, and Marathi.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
